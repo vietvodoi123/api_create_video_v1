@@ -20,6 +20,8 @@ app = FastAPI()
 # CSDL giả lưu trạng thái video (video_id -> {status: ..., url: ...})
 video_db = {}
 
+# Giả sử bạn có Roboto-Regular.ttf trong thư mục fonts
+font_path = "fonts/static/Roboto-Regular.ttf"
 
 class VideoRequest(BaseModel):
     story_name: str  # Tên của bộ truyện
@@ -120,10 +122,7 @@ def process_video(video_id: str, story_name: str, chapter: str, image_path: str,
         # --- Bước 3: Tạo video ---
         # Tạo ImageClip từ hình ảnh với thời lượng bằng với audio ghép
         image_clip = ImageClip(image_path, duration=final_audio.duration)
-        # Tạo TextClip: nội dung là kết hợp tên truyện và số tập
-        combined_text = f"{story_name} - Tập {chapter}"
-        # Cung cấp font hợp lệ (ví dụ: Arial trên Windows)
-        font_path = "C:/Windows/Fonts/arial.ttf"
+
         # Tạo text clip cho dòng đầu (font size 48)
         text_clip1 = TextClip(
             text=story_name,
