@@ -2,6 +2,7 @@ import os
 import uuid
 import shutil
 import requests
+import json
 from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 from typing import List
@@ -20,15 +21,14 @@ app = FastAPI()
 # CSDL giả lưu trạng thái video (video_id -> {status: ..., url: ...})
 video_db = {}
 
-# Giả sử bạn có Roboto-Regular.ttf trong thư mục fonts
+# Giả sử bạn có Roboto-Regular.ttf trong thư mục fonts/static
 font_path = "fonts/static/Roboto-Regular.ttf"
 
 class VideoRequest(BaseModel):
     story_name: str  # Tên của bộ truyện
-    chapter: str  # Tập thứ bao nhiêu (có thể là số hoặc chuỗi)
+    chapter: str     # Tập thứ bao nhiêu (có thể là số hoặc chuỗi)
     image_path: str  # Đường dẫn hình ảnh (file ảnh)
     audio_urls: List[str]  # Mảng các URL audio
-
 
 @app.post("/create_video")
 async def create_video(video_req: VideoRequest, background_tasks: BackgroundTasks):
@@ -46,13 +46,11 @@ async def create_video(video_req: VideoRequest, background_tasks: BackgroundTask
     )
     return {"video_id": video_id}
 
-
 @app.get("/video_status/{video_id}")
 async def video_status(video_id: str):
     if video_id not in video_db:
         return {"error": "Video not found"}
     return video_db[video_id]
-
 
 def download_file(url: str, dest_path: str):
     """Tải file từ URL và lưu vào dest_path"""
@@ -64,20 +62,22 @@ def download_file(url: str, dest_path: str):
     else:
         raise Exception("Failed to download file from url: " + url)
 
-
 def upload_to_googledrive(file_path: str) -> str:
     """
     Upload file lên Google Drive sử dụng service account.
-    Bạn cần thay đổi SERVICE_ACCOUNT_FILE và FOLDER_ID theo cấu hình của bạn.
+    Lấy thông tin credentials từ biến môi trường GOOGLE_SERVICE_ACCOUNT_INFO.
     """
-    # Đường dẫn tới file credentials của service account (định dạng JSON)
-    SERVICE_ACCOUNT_FILE = 'service_account_credentials.json'
+    # Lấy thông tin credentials từ biến môi trường (JSON string)
+    service_account_info_str = os.environ.get("GOOGLE_SERVICE_ACCOUNT_INFO")
+    if not service_account_info_str:
+        raise Exception("Environment variable GOOGLE_SERVICE_ACCOUNT_INFO not set")
+    service_account_info = json.loads(service_account_info_str)
+
     # ID của thư mục trên Google Drive mà bạn muốn upload file vào
     FOLDER_ID = '1Xz3fU5KTOwXsibOyAqxhR8StvJkIYYJD'
-
     SCOPES = ['https://www.googleapis.com/auth/drive']
-    credentials = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info, scopes=SCOPES)
     service = build('drive', 'v3', credentials=credentials)
 
     file_metadata = {
@@ -103,7 +103,6 @@ def upload_to_googledrive(file_path: str) -> str:
     # Trả về đường dẫn xem file trên Google Drive
     return f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
 
-
 def process_video(video_id: str, story_name: str, chapter: str, image_path: str, audio_urls: List[str]):
     try:
         # --- Bước 1: Tải các file audio về ---
@@ -126,7 +125,7 @@ def process_video(video_id: str, story_name: str, chapter: str, image_path: str,
         # Tạo text clip cho dòng đầu (font size 48)
         text_clip1 = TextClip(
             text=story_name,
-            font=font_path,method='caption',  size=(image_clip.w - 2*10, None),
+            font=font_path, method='caption', size=(image_clip.w - 2*10, None),
             font_size=30,
             color='white',
             duration=final_audio.duration
@@ -136,28 +135,20 @@ def process_video(video_id: str, story_name: str, chapter: str, image_path: str,
         text_clip2 = TextClip(
             text=chapter,
             font=font_path,
-            font_size=20,size=(image_clip.w - 2*10, None),
+            font_size=20, size=(image_clip.w - 2*10, None),
             color='white',
             duration=final_audio.duration
         )
         # Xác định vị trí của các text clip (góc dưới bên trái)
         margin = 10  # lề cách biên trái và dưới 10 pixel
-
-        # Lấy kích thước của ảnh nền (width, height)
         w, h = image_clip.size
-
-        # Lấy chiều cao của từng text clip
         line1_height = text_clip1.h
         line2_height = text_clip2.h
-
-        # Đặt vị trí cho từng text clip bằng lambda trả về tọa độ (x, y)
-        # TextClip thứ nhất đặt phía trên text thứ hai
         text_clip1.pos = lambda t: (margin, h - line1_height - line2_height - margin * 2)
-        # TextClip thứ hai đặt ngay dưới, cách dưới 10 pixel
         text_clip2.pos = lambda t: (margin, h - line2_height - margin)
 
         # Ghép ImageClip và TextClip thành video
-        video_clip = CompositeVideoClip([image_clip, text_clip1,text_clip2]).with_duration(final_audio.duration)
+        video_clip = CompositeVideoClip([image_clip, text_clip1, text_clip2]).with_duration(final_audio.duration)
         video_clip.audio = final_audio
 
         # Xuất video ra file
@@ -166,7 +157,6 @@ def process_video(video_id: str, story_name: str, chapter: str, image_path: str,
 
         # --- Bước 4: Upload video lên Google Drive ---
         video_url = upload_to_googledrive(video_file)
-        # Cập nhật trạng thái video trong CSDL giả
         video_db[video_id]["status"] = "completed"
         video_db[video_id]["url"] = video_url
 
