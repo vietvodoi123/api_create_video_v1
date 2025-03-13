@@ -24,17 +24,45 @@ video_db = {}
 # Giả sử bạn có Roboto-Regular.ttf trong thư mục fonts/static
 font_path = "fonts/static/Roboto-Regular.ttf"
 
+def send_webhook(video_id: str):
+    """Gửi webhook khi video hoàn thành"""
+    task_info = video_db.get(video_id)
+    if not task_info or not task_info.get("webhook_url"):
+        return  # Không có webhook thì bỏ qua
+
+    data = {
+        "task_id": task_info["task_id"],
+        "status": task_info["status"],
+        "video_url": task_info["url"],
+    }
+
+    try:
+        response = requests.post(task_info["webhook_url"], json=data)
+        response.raise_for_status()
+        print(f"✅ Webhook gửi thành công: {response.json()}")
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Lỗi khi gửi webhook: {e}")
+
+
 class VideoRequest(BaseModel):
+    task_id:str
     story_name: str  # Tên của bộ truyện
     chapter: str     # Tập thứ bao nhiêu (có thể là số hoặc chuỗi)
     image_path: str  # Đường dẫn hình ảnh (file ảnh)
     audio_urls: List[str]  # Mảng các URL audio
+    webhook_url: str | None = None  # Webhook có thể có hoặc không
 
 @app.post("/create_video")
 async def create_video(video_req: VideoRequest, background_tasks: BackgroundTasks):
     video_id = str(uuid.uuid4())
     # Khởi tạo trạng thái video là "processing"
-    video_db[video_id] = {"status": "processing", "url": None}
+    video_db[video_id] = {
+        "status": "processing",
+        "url": None,
+        "task_id": video_req.task_id,
+        "webhook_url": video_req.webhook_url  # Lưu webhook nếu có
+    }
+
     # Thêm task chạy background
     background_tasks.add_task(
         process_video,
@@ -44,7 +72,7 @@ async def create_video(video_req: VideoRequest, background_tasks: BackgroundTask
         video_req.image_path,
         video_req.audio_urls
     )
-    return {"video_id": video_id}
+    return {"video_id": video_id,"status": "processing", "url": None ,"task_id":video_req.task_id }
 
 @app.get("/video_status/{video_id}")
 async def video_status(video_id: str):
@@ -159,6 +187,7 @@ def process_video(video_id: str, story_name: str, chapter: str, image_path: str,
         video_url = upload_to_googledrive(video_file)
         video_db[video_id]["status"] = "completed"
         video_db[video_id]["url"] = video_url
+        send_webhook(video_id)  # Gửi webhook
 
     except Exception as e:
         video_db[video_id]["status"] = f"error: {str(e)}"

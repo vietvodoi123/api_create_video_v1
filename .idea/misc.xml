@@ -3,4 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="Python 3.13 (makevideo)" />
   </component>
+  <component name="ProjectRootManager" version="2" project-jdk-name="Python 3.13 (api_get_text_and_audio)" project-jdk-type="Python SDK" />
 </project>
