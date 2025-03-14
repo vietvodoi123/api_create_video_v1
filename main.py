@@ -4,7 +4,7 @@ import shutil
 import requests
 import json
 import asyncio
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 from typing import List
 from dotenv import load_dotenv
@@ -22,17 +22,15 @@ load_dotenv()
 
 app = FastAPI()
 
-# Hàng đợi xử lý video
-task_queue = asyncio.Queue()
-running_tasks = set()  # Danh sách task đang chạy
-MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", 2)) # Giới hạn tối đa 2 task chạy cùng lúc
+# Giới hạn số tác vụ background chạy đồng thời bằng semaphore
+MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", 2))
+video_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
-# CSDL giả lưu trạng thái video
+# CSDL giả lưu trạng thái video (in-memory)
 video_db = {}
 
 # Đường dẫn font chữ
 font_path = "fonts/static/Roboto-Regular.ttf"
-
 
 class VideoRequest(BaseModel):
     task_id: str
@@ -42,117 +40,93 @@ class VideoRequest(BaseModel):
     audio_urls: List[str]
     webhook_url: str | None = None
 
-
 @app.post("/create_video")
-async def create_video(video_req: VideoRequest):
-    """ Nhận yêu cầu tạo video và đưa vào hàng chờ """
+async def create_video(video_req: VideoRequest, background_tasks: BackgroundTasks):
+    """
+    Nhận yêu cầu tạo video và chạy background task.
+    Sử dụng BackgroundTasks của FastAPI để schedule quá trình xử lý video.
+    """
     video_id = str(uuid.uuid4())
-
-    # Lưu trạng thái video là "đang xử lý"
     video_db[video_id] = {
         "status": "queued",
         "url": None,
         "task_id": video_req.task_id,
         "webhook_url": video_req.webhook_url
     }
-
-    # Đưa task vào hàng chờ
-    await task_queue.put(
-        (video_id, video_req.story_name, video_req.chapter, video_req.image_path, video_req.audio_urls))
-
-    # Gọi kiểm tra để chạy task nếu có slot trống
-    asyncio.create_task(check_queue())
-
+    # Schedule background task
+    background_tasks.add_task(process_video, video_id, video_req.story_name, video_req.chapter, video_req.image_path, video_req.audio_urls)
     return {"video_id": video_id, "status": "queued", "task_id": video_req.task_id}
-
 
 @app.get("/video_status/{video_id}")
 async def video_status(video_id: str):
     if video_id not in video_db:
-        return {"error": "Video not found"}
+        raise HTTPException(status_code=404, detail="Video not found")
     return video_db[video_id]
 
-
-async def check_queue():
-    """ Kiểm tra và chạy task nếu có slot trống """
-    while len(running_tasks) < MAX_CONCURRENT_TASKS and not task_queue.empty():
-        video_data = await task_queue.get()
-        video_id = video_data[0]
-
-        running_tasks.add(video_id)
-        video_db[video_id]["status"] = "processing"
-
-        asyncio.create_task(process_video(*video_data))
-
-
 async def process_video(video_id: str, story_name: str, chapter: str, image_path: str, audio_urls: List[str]):
-    """ Xử lý video và upload lên Google Drive """
-    try:
-        # --- Tải file audio ---
-        audio_files = []
-        for idx, url in enumerate(audio_urls):
-            temp_audio_path = f"temp_audio_{video_id}_{idx}.mp3"
-            await download_file(url, temp_audio_path)
-            audio_files.append(temp_audio_path)
+    """
+    Xử lý video và upload lên Google Drive.
+    Giới hạn concurrency bằng cách sử dụng semaphore.
+    """
+    async with video_semaphore:
+        try:
+            video_db[video_id]["status"] = "processing"
+            # --- Tải file audio ---
+            audio_files = []
+            for idx, url in enumerate(audio_urls):
+                temp_audio_path = f"temp_audio_{video_id}_{idx}.mp3"
+                await download_file(url, temp_audio_path)
+                audio_files.append(temp_audio_path)
 
-        # --- Ghép audio ---
-        audio_clips = [AudioFileClip(file) for file in audio_files]
-        final_audio = concatenate_audioclips(audio_clips)
-        final_audio_path = f"final_audio_{video_id}.mp3"
-        final_audio.write_audiofile(final_audio_path)
+            # --- Ghép audio ---
+            audio_clips = [AudioFileClip(file) for file in audio_files]
+            final_audio = concatenate_audioclips(audio_clips)
+            final_audio_path = f"final_audio_{video_id}.mp3"
+            final_audio.write_audiofile(final_audio_path)
 
-        # --- Tạo video ---
-        image_clip = ImageClip(image_path, duration=final_audio.duration)
-        text_clip1 = TextClip(text=story_name, font=font_path, font_size=30, color='white',
-                              duration=final_audio.duration)
-        text_clip2 = TextClip(text=chapter, font=font_path, font_size=20, color='white', duration=final_audio.duration)
+            # --- Tạo video ---
+            image_clip = ImageClip(image_path, duration=final_audio.duration)
+            text_clip1 = TextClip(text=story_name, font=font_path, font_size=30, color='white', duration=final_audio.duration)
+            text_clip2 = TextClip(text=chapter, font=font_path, font_size=20, color='white', duration=final_audio.duration)
 
-        # Định vị text
-        w, h = image_clip.size
-        text_clip1 = text_clip1.with_position(("center", h - 80))
-        text_clip2 = text_clip2.with_position(("center", h - 40))
+            # Định vị text ở vị trí center dưới cùng
+            w, h = image_clip.size
+            text_clip1 = text_clip1.with_position(("center", h - 80))
+            text_clip2 = text_clip2.with_position(("center", h - 40))
 
-        # Ghép video
-        video_clip = CompositeVideoClip([image_clip, text_clip1, text_clip2]).with_duration(final_audio.duration)
-        video_clip.audio = final_audio
+            video_clip = CompositeVideoClip([image_clip, text_clip1, text_clip2]).with_duration(final_audio.duration)
+            video_clip.audio = final_audio
 
-        # Xuất video ra file
-        video_file = f"video_{video_id}.mp4"
-        video_clip.write_videofile(video_file, fps=24)
+            # Xuất video ra file
+            video_file = f"video_{video_id}.mp4"
+            video_clip.write_videofile(video_file, fps=24)
 
-        # --- Upload lên Google Drive ---
-        video_url = await upload_to_googledrive(video_file)
-        video_db[video_id]["status"] = "completed"
-        video_db[video_id]["url"] = video_url
-        send_webhook(video_id)
+            # --- Upload lên Google Drive ---
+            video_url = await upload_to_googledrive(video_file)
+            video_db[video_id]["status"] = "completed"
+            video_db[video_id]["url"] = video_url
+            send_webhook(video_id)
 
-    except Exception as e:
-        video_db[video_id]["status"] = f"error: {str(e)}"
-    finally:
-        # Xóa task khỏi danh sách đang chạy
-        running_tasks.remove(video_id)
-        # Xóa file tạm
-        for file in audio_files:
-            if os.path.exists(file):
-                os.remove(file)
-        if os.path.exists(final_audio_path):
-            os.remove(final_audio_path)
-        if os.path.exists(video_file):
-            os.remove(video_file)
-
-        # Kiểm tra và tiếp tục chạy task mới nếu có
-        asyncio.create_task(check_queue())
-
+        except Exception as e:
+            video_db[video_id]["status"] = f"error: {str(e)}"
+        finally:
+            # Xóa file tạm
+            for file in audio_files:
+                if os.path.exists(file):
+                    os.remove(file)
+            if os.path.exists(final_audio_path):
+                os.remove(final_audio_path)
+            if os.path.exists(video_file):
+                os.remove(video_file)
 
 async def download_file(url: str, dest_path: str):
-    """ Tải file từ URL và lưu vào dest_path """
+    """Tải file từ URL và lưu vào dest_path (sử dụng requests, nên cân nhắc chạy blocking code trong thread pool nếu cần)"""
     response = requests.get(url, stream=True)
     if response.status_code == 200:
         with open(dest_path, 'wb') as out_file:
             shutil.copyfileobj(response.raw, out_file)
     else:
         raise Exception(f"Failed to download file from {url}")
-
 
 async def upload_to_googledrive(file_path: str) -> str:
     """ Upload file lên Google Drive """
@@ -171,13 +145,10 @@ async def upload_to_googledrive(file_path: str) -> str:
     uploaded_file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
 
     file_id = uploaded_file.get('id')
-
-    # Cấp quyền truy cập công khai
     permission = {'type': 'anyone', 'role': 'reader'}
     service.permissions().create(fileId=file_id, body=permission).execute()
 
     return f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
-
 
 def send_webhook(video_id: str):
     """ Gửi webhook khi video hoàn thành """
@@ -186,7 +157,6 @@ def send_webhook(video_id: str):
         return
 
     data = {"task_id": task_info["task_id"], "status": task_info["status"], "video_url": task_info["url"]}
-
     try:
         response = requests.post(task_info["webhook_url"], json=data)
         response.raise_for_status()
